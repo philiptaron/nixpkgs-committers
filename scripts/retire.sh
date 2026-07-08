@@ -5,7 +5,9 @@ source "$(dirname -- "${BASH_SOURCE[0]}")"/common.sh
 shopt -s nullglob
 
 usage() {
-  log "Usage: $0 ORG ACTIVITY_REPO MEMBER_REPO DIR NOTICE_CUTOFF CLOSE_CUTOFF"
+  log "Usage: $0 ORG ACTIVITY_REPO MEMBER_REPO DIR NOTICE_CUTOFF CLOSE_CUTOFF CONFIRM_CUTOFF"
+  log ""
+  log "Optionally set CACHE_FILE to a path for persisting activity observations between runs."
   exit 1
 }
 
@@ -15,14 +17,30 @@ MEMBER_REPO=${3:-$(usage)}
 DIR=${4:-$(usage)}
 NOTICE_CUTOFF=${5:-$(usage)}
 CLOSE_CUTOFF=${6:-$(usage)}
+CONFIRM_CUTOFF=${7:-$(usage)}
 
 mainBranch=$(git branch --show-current)
 noticeCutoff=$(date --date="$NOTICE_CUTOFF" +%s)
+
+nowEpoch=$(date +%s)
 
 # People that received the commit bit after this date won't be retired
 newCutoff=$(date --date="1 year ago" +%s)
 # Users whose retirement PRs were closed after this date won't be retired
 closeCutoff=$(date --date="$CLOSE_CUTOFF" +%s)
+# Users first observed as inactive after this date won't be retired yet;
+# they keep being checked until the observation is old enough.
+# This prevents a single spurious empty response from the /commits endpoint
+# from causing an accidental retirement PR (see issue #100).
+confirmCutoff=$(date --date="$CONFIRM_CUTOFF" +%s)
+
+# People are considered active if they merged a PR after this date
+yearAgo=$(date --date='1 year ago' +%s)
+# Cached merges newer than this are trusted without querying GitHub again.
+# The gap until the 1-year mark means the /commits endpoint gets queried
+# for about a month of daily runs before a retirement PR can be opened,
+# so a retirement is backed by many independent queries agreeing.
+queryCutoff=$(date --date='11 months ago' +%s)
 
 # We need to know when people received their commit bit to avoid retiring them within the first year.
 # For now this is done either with the git creation date of the file, or its contents:
@@ -53,6 +71,33 @@ else
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' exit
 fi
+
+# Activity observed by previous runs, so that the unreliable /commits
+# endpoint doesn't need to be trusted on a single response (see issue #100).
+# The cache only holds positive evidence (merges the API actually returned)
+# plus the time somebody was first observed as inactive,
+# so a spurious empty response can never make a cached-active user look inactive.
+# Bump this version to invalidate all previously cached data.
+cacheVersion=1
+declare -A cachedMergeEpoch cachedMergePr cachedFirstInactive
+if [[ -n "${CACHE_FILE:-}" ]]; then
+  CACHE_FILE=$(realpath -m -- "$CACHE_FILE")
+  if [[ -f "$CACHE_FILE" ]] && [[ $(head -n 1 "$CACHE_FILE") == "# retire-cache v$cacheVersion" ]]; then
+    while IFS=, read -r cLogin cMergeEpoch cMergePr cFirstInactive; do
+      [[ "$cLogin" == '#'* ]] && continue
+      cachedMergeEpoch[$cLogin]=$cMergeEpoch
+      cachedMergePr[$cLogin]=$cMergePr
+      cachedFirstInactive[$cLogin]=$cFirstInactive
+    done < "$CACHE_FILE"
+    log "Loaded activity cache with ${#cachedMergeEpoch[@]} entries from $CACHE_FILE"
+  else
+    log "No usable activity cache at $CACHE_FILE, starting fresh"
+  fi
+fi
+
+# Matches the merge lines produced by the jq filter below,
+# capturing the merge date and PR number for the cache
+mergeLineRegex='^- `([^`]+)` .*(#[0-9]+)$'
 
 mkdir -p "$DIR"
 cd "$DIR"
@@ -108,22 +153,72 @@ for login in *; do
     continue
   fi
 
-  PR_PREFIX="$ORG/$ACTIVITY_REPO" \
-  trace gh api -X GET /repos/"$ORG"/"$ACTIVITY_REPO"/commits \
-    -f since="$(date --date='1 year ago' --iso-8601=seconds)" \
-    -f author="$login" \
-    -f committer=web-flow \
-    -f per_page=100 \
-    --jq '.[] |
-      # PR merge commits have two parents. We also check it’s an
-      # authentic GitHub commit, because… why not?
-      select((.parents | length) == 2 and .commit.verification.verified) |
-      (.commit.message | capture(" \\((?<pr>#[0-9]+)\\)$").pr) as $pr |
-      "- `\(.commit.committer.date)` – \(env.PR_PREFIX)\($pr)"' \
-    > "$tmp/$login"
-  mergeCount=$(wc -l <"$tmp/$login")
+  # What previous runs observed about this person's merge activity
+  mergeEpoch=${cachedMergeEpoch[$login]:-0}
+  mergePr=${cachedMergePr[$login]:-}
+  firstInactive=${cachedFirstInactive[$login]:-0}
+
+  : > "$tmp/$login"
+  mergeCount=0
+  queried=
+  if [[ "$prState" != open ]] && (( mergeEpoch > queryCutoff )); then
+    # Recent cached activity already rules out retirement,
+    # no need to bother the unreliable /commits endpoint
+    :
+  else
+    queried=1
+    if [[ "$prState" == open ]]; then
+      # The PR comment lists activity from the whole past year
+      sinceEpoch=$yearAgo
+    else
+      # Otherwise only merges newer than the cached one are of interest
+      sinceEpoch=$(( mergeEpoch > yearAgo ? mergeEpoch + 1 : yearAgo ))
+    fi
+    PR_PREFIX="$ORG/$ACTIVITY_REPO" \
+    trace gh api -X GET /repos/"$ORG"/"$ACTIVITY_REPO"/commits \
+      -f since="$(date --date=@"$sinceEpoch" --iso-8601=seconds)" \
+      -f author="$login" \
+      -f committer=web-flow \
+      -f per_page=100 \
+      --jq '.[] |
+        # PR merge commits have two parents. We also check it’s an
+        # authentic GitHub commit, because… why not?
+        select((.parents | length) == 2 and .commit.verification.verified) |
+        (.commit.message | capture(" \\((?<pr>#[0-9]+)\\)$").pr) as $pr |
+        "- `\(.commit.committer.date)` – \(env.PR_PREFIX)\($pr)"' \
+      > "$tmp/$login"
+    mergeCount=$(wc -l <"$tmp/$login")
+  fi
+
+  if (( mergeCount > 0 )); then
+    # Cache the newest merge (first line, the endpoint returns newest first)
+    if [[ $(head -n 1 "$tmp/$login") =~ $mergeLineRegex ]]; then
+      newestMergeEpoch=$(date --date="${BASH_REMATCH[1]}" +%s)
+      if (( newestMergeEpoch > mergeEpoch )); then
+        mergeEpoch=$newestMergeEpoch
+        mergePr=${BASH_REMATCH[2]}
+      fi
+    fi
+    firstInactive=0
+  elif [[ -n "$queried" ]] && (( firstInactive == 0 )); then
+    # An empty response might just be a timeout of the endpoint (issue #100),
+    # so this only starts the inactivity clock; retirement additionally needs
+    # all queries until the confirmation cutoff to keep coming back empty
+    firstInactive=$nowEpoch
+  fi
+
+  # Remember the observations for the cache written at the end of the run
+  cachedMergeEpoch[$login]=$mergeEpoch
+  cachedMergePr[$login]=$mergePr
+  cachedFirstInactive[$login]=$firstInactive
 
   if [[ "$prState" == open ]]; then
+    if (( mergeCount == 0 && mergeEpoch > yearAgo )); then
+      # The query came back empty even though the cache proves activity
+      # (issue #100), so reconstruct the activity list from the cache
+      echo "- \`$(date --date=@"$mergeEpoch" --iso-8601=seconds)\` – $ORG/$ACTIVITY_REPO$mergePr" > "$tmp/$login"
+      mergeCount=1
+    fi
     # If there is an open PR already
     prNumber=$(jq .number <<< "$prInfo")
     epochCreatedAt=$(jq '.created_at | fromdateiso8601' <<< "$prInfo")
@@ -156,7 +251,15 @@ for login in *; do
     else
       log "$login has a retirement PR pending"
     fi
-  elif (( mergeCount <= 0 )); then
+  elif (( mergeEpoch > yearAgo )); then
+    if (( mergeCount > 0 )); then
+      log "$login is active with $mergeCount new merges"
+    else
+      log "$login is active, last known merge $mergePr on $(date --date=@"$mergeEpoch" --iso-8601=seconds) (cached)"
+    fi
+  elif (( firstInactive > confirmCutoff )); then
+    log "$login appears inactive since $(date --date=@"$firstInactive" --iso-8601=seconds), continuing to check before opening a PR"
+  else
     log "$login has become inactive, opening a PR"
     # If there is no PR yet, but they have become inactive
     (
@@ -189,8 +292,18 @@ for login in *; do
         /repos/"$ORG"/"$MEMBER_REPO"/issues/"$prNumber"/labels \
         -f "labels[]=retirement" >/dev/null
     )
-  else
-    log "$login is active with $mergeCount merges"
   fi
   log ""
 done
+
+if [[ -n "${CACHE_FILE:-}" ]]; then
+  mkdir -p "$(dirname -- "$CACHE_FILE")"
+  {
+    echo "# retire-cache v$cacheVersion"
+    for login in *; do
+      echo "$login,${cachedMergeEpoch[$login]:-0},${cachedMergePr[$login]:-},${cachedFirstInactive[$login]:-0}"
+    done
+  } > "$CACHE_FILE".tmp
+  mv "$CACHE_FILE".tmp "$CACHE_FILE"
+  log "Wrote activity cache to $CACHE_FILE"
+fi
